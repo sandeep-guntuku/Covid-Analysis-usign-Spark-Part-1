@@ -1,0 +1,172 @@
+from datetime import datetime
+from functools import lru_cache
+
+import pyspark.sql.functions as F
+from pyspark.sql import SparkSession
+
+
+@lru_cache(maxsize=None)
+def get_spark(name="covid") -> SparkSession:
+    return SparkSession.builder.appName(name).getOrCreate()
+
+
+def read_data(path="data/covid/usa_covid_cases.json", prefix='_'):
+    """
+    Reads json data and converts columns starting with `prefix` to int.
+    Data from bigquery-public-data:covid19_usafacts confirmed_cases, and deaths
+    """
+    df = get_spark().read.json(path)
+    date_columns = [c for c in df.columns if c.startswith(prefix)]
+    other_columns = list(set(df.columns) - set(date_columns))
+    columns = other_columns + [F.col(c).cast("int").alias(c) for c in date_columns]
+    return df.select(*columns)
+
+
+def read_data_slow_withColumn(path="data/covid/usa_covid_cases.json"):
+    """
+    Reads json data and converts columns starting with _ to int.
+    Very slow because of the use of withColumn.
+    Compare to read_data
+    """
+    df = get_spark().read.json(path)
+    for c in [c for c in df.columns if c.startswith("_")]:
+        df = df.withColumn(c, F.col(c).cast("int").alias(c))
+    return df
+
+
+def normalize_covid(df, prefix='_'):
+    """
+    Normalizes covid DataFrames of bigquery-public-data:covid19_usafacts confirmed_cases, and deaths.
+    Converts many date columns to rows of dates with their associated count values.
+    """
+    date_columns = [c for c in df.columns if c.startswith(prefix)]
+    other_columns = list(set(df.columns) - set(date_columns))
+    # Transform columns of dates into rows of dates.
+    # Date columns headings are converted to a literal column array.
+    # Date values are placed into an array
+    # The dates and values are zipped and then exploded into multiple rows.
+    # https://stackoverflow.com/questions/41027315/pyspark-split-multiple-array-columns-into-rows
+    columns = other_columns + [F.explode(F.arrays_zip(F.array([F.lit(c[1:]) for c in date_columns]).alias('date'),
+                                                      F.array(*date_columns).alias('counts'))).alias('dc')]
+    df = df.select(*columns)
+    # Get the date and column from the zipped structured. Convert the date from string to date.
+    columns = other_columns + [F.to_date(df.dc.date, 'yyyy_MM_dd').alias('date'), df.dc.counts.alias('counts')]
+    return df.select(*columns)
+
+
+def columns_as_dates(df):
+    return [datetime.strptime(c[1:], '%Y_%m_%d') for c in df.columns if c.startswith("_")]
+
+
+# TODO complete this code
+def create_dataset():
+    """
+    Prepare the given data for analysis.
+    :return: one `DataFrame` with all the data.
+    """
+    # Read json file usa_covid_cases.json and usa_covid_deaths.json
+    cases_df = read_data("/Users/gopisandeepguntuku/Documents/CIS 8795 Big Data Infrastructure/DataAnalysisWithPythonAndPySpark/data/covid/usa_covid_cases.json", '_')
+    deaths_df = read_data("/Users/gopisandeepguntuku/Documents/CIS 8795 Big Data Infrastructure/DataAnalysisWithPythonAndPySpark/data/covid/usa_covid_deaths.json", '_')
+    # Normalizing and Renaming the columns
+    cases_df = normalize_covid(cases_df).withColumnRenamed('counts','cases')
+    deaths_df = normalize_covid(deaths_df).withColumnRenamed('counts','deaths')
+    # Join into one DataFrame
+    df = cases_df.join(deaths_df, ['county_fips_code','state','date'])
+    # Drop duplicate columns
+    drop_df = df.drop(deaths_df.county_name).drop(deaths_df.state_fips_code)
+    return drop_df
+
+
+# TODO complete this code
+def county_totals(df, kind='cases'):
+    """
+    Totals the kind of cases by county. Kind can be cases or deaths.
+    :return: `DataFrame` with county totals, sorted in decending order
+    """
+    # group by county, the sum the cases, order by the totals
+    # include county name and state in group to see those in output (or join back into orignal data)
+    if not (kind == 'cases' or kind == 'deaths'):
+        raise NotImplementedError
+    return df.groupby('county_fips_code', 'county_name', 'state') \
+        .agg(F.sum(kind).alias('total')).orderBy('total', ascending=False)
+
+# TODO complete this code
+def county_totals(df, kind='cases', ascending=False):
+    """
+    Totals the kind of cases by county.
+    :param kind: cases or deaths
+    :param ascending: Determines ordering of results
+    :return: `DataFrame` with county totals, sorted according to `ascending` order
+    """
+    # group by county, the sum the cases, order by the totals
+    # include county name and state in group to see those in output (or join back into orignal data)
+    if not (kind == 'cases' or kind == 'deaths'):
+        raise NotImplementedError
+    return df.groupby('county_fips_code', 'county_name', 'state') \
+        .agg(F.sum(kind).alias('total')).orderBy('total', ascending=ascending)
+
+
+# TODO complete this code
+def state_totals(df, kind='cases', ascending=False):
+    """
+    Totals the kind of cases by state.
+    :param kind: cases or deaths
+    :param ascending: Determines ordering of results
+    :return: `DataFrame` with county totals, sorted according to `ascending` order
+    """
+    # group by state, sum the cases, order by the totals
+    return df.groupby('state') \
+        .agg(F.sum(kind).alias('total')).orderBy('total', ascending=ascending)
+
+
+# TODO complete this code
+def case_death_ratio(df, ascending=False):
+    """
+    Ratio of total deaths / total cases by state.
+    :param ascending: Determines ordering of results
+    :return: `DataFrame` with county totals, sorted according to `ascending` order
+    """
+    # group by state, sum the cases, order by the totals
+    return df.groupby('state') \
+        .agg((F.sum('deaths') / F.sum('cases')).alias('ratio')).orderBy('ratio', ascending=ascending)
+
+
+# TODO complete this code
+def my_stats(df, kind='cases', ascending=False):
+    """
+    Your own statistic. Can be anything.
+    :param kind: cases or deaths [Define or use parameters as you like]
+    :param ascending: Determines ordering of results
+    :return: `DataFrame` with county totals, sorted according to `ascending` order
+    """
+    # filter by state and the cases, order by the kind
+    print("Query showing the dates on which California State registered greater than 2.63M cases")
+    df = df.filter((F.col('state') == 'CA') & (F.col('cases') >= 2630000)) \
+            .select('state', 'date', 'county_name', 'cases').orderBy(kind, ascending=False)
+    return df
+
+def main():
+    show_num = 6
+    data = create_dataset()
+    print("Most county cases")
+    county_totals(data, kind='cases').show(show_num)
+    print("Least county cases")
+    county_totals(data, kind='cases', ascending=True).show(show_num)
+    print("Most county deaths")
+    county_totals(data, kind='deaths').show(show_num)
+    print("Least county deaths")
+    county_totals(data, kind='deaths', ascending=True).show(show_num)
+    print("Most state cases")
+    state_totals(data, kind='cases').show(show_num)
+    print("Most state deaths")
+    state_totals(data, kind='deaths').show(show_num)
+    print("Best death/case ratio")
+    case_death_ratio(data).show(show_num)
+    print("Worst death/case ratio")
+    case_death_ratio(data, ascending=True).show(show_num)
+    # TODO edit the following as necessary
+    print("My stats")
+    my_stats(data, kind='deaths', ascending=True).show()
+
+if __name__ == '__main__':
+    main()
